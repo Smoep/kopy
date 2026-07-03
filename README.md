@@ -1,6 +1,6 @@
 # Kopy
 
-Kopy is a fast macOS menu bar clipboard manager with a radial overlay for paste-by-number.
+Kopy is a macOS menu bar clipboard manager that captures history, favorites, and image clips, then lets you paste fast with a radial overlay.
 
 ## Why Kopy
 - Keep a searchable clipboard history for text and images
@@ -23,4 +23,4 @@ Kopy is a fast macOS menu bar clipboard manager with a radial overlay for paste-
 - AppKit
 
 ## Search Keywords
-macOS clipboard manager, menu bar clipboard app, clipboard history, global shortcut paste, radial paste overlay, SwiftUI mac app
+macOS clipboard manager, clipboard history, menu bar clipboard app, clipboard history manager, global shortcut paste, radial paste overlay, paste by number, SwiftUI mac app
