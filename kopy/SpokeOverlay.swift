@@ -172,6 +172,8 @@ final class SpokeOverlay {
     private var globalClickMonitor: Any?
     private var localEventMonitor: Any?
     private var mouseTracker: MouseTracker?
+    private var scrollAccumulator: CGFloat = 0
+    private var cursorMoved: Bool = false
     private var hitZones: [HitZone] = []
     private var favHitZones: [HitZone] = []
     private var previousApp: NSRunningApplication?
@@ -184,6 +186,7 @@ final class SpokeOverlay {
     private var layoutPreviewGap: CGFloat = 16
     private var layoutPreviewWidth: CGFloat = 160
     private var layoutPreviewLength: Int = 20
+    private var layoutFavCount: Int = 0
 
     private init() {}
 
@@ -205,8 +208,13 @@ final class SpokeOverlay {
         let displayItems = Array(items.prefix(maxItems))
         currentItems = displayItems
         self.allItems = Array(items.prefix(settings.historyDepth))
-        let favs = settings.favorites.sorted { $0.order < $1.order }
-        currentFavorites = favs
+        let allFavs = settings.favorites.sorted { $0.order < $1.order }
+        // Window favorites to the same max as clipboard items; the rest are
+        // reachable by scrolling on the favorites (left) side.
+        let favWindowCount = min(allFavs.count, settings.overlayItemCount)
+        let favs = Array(allFavs.prefix(favWindowCount))
+        currentFavorites = allFavs
+        layoutFavCount = favWindowCount
         hide()
 
         let spokeRadius = settings.spokeRadius
@@ -429,7 +437,11 @@ final class SpokeOverlay {
 
         let tracker = MouseTracker()
         tracker.isSearching = true
+        tracker.scrollOffset = 0
+        tracker.favScrollOffset = 0
         mouseTracker = tracker
+        scrollAccumulator = 0
+        cursorMoved = false
 
         let backdropController = OverlayBackdropController()
         self.backdropController = backdropController
@@ -438,6 +450,7 @@ final class SpokeOverlay {
             items: displayItems,
             allItems: allItems,
             favorites: favs,
+            allFavorites: allFavs,
             previewLength: settings.overlayPreviewLength,
             backdropSpread: CGFloat(settings.overlayBackdropSpread),
             backdropIntensity: CGFloat(settings.overlayBackdropIntensity),
@@ -520,7 +533,7 @@ final class SpokeOverlay {
     }
 
     private func installEventMonitors() {
-        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .keyDown, .flagsChanged]) { [weak self] event in
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .keyDown, .flagsChanged, .scrollWheel]) { [weak self] event in
             guard let self else { return event }
 
             if event.type == .flagsChanged {
@@ -528,7 +541,36 @@ final class SpokeOverlay {
                 return event
             }
 
+            if event.type == .scrollWheel {
+                guard (self.mouseTracker?.searchText ?? "").isEmpty else { return nil }
+                let dy = -event.scrollingDeltaY
+                // Until the cursor moves, there's no side decision yet → default
+                // to clipboard items (right). Once moved, use the true centre
+                // split so even a slight move left switches to favorites.
+                let onFavSide = self.cursorMoved && event.locationInWindow.x < self.layoutCenterX
+                var pendingSteps = 0
+                if event.hasPreciseScrollingDeltas {
+                    self.scrollAccumulator += dy
+                    let threshold: CGFloat = 28
+                    if abs(self.scrollAccumulator) >= threshold {
+                        pendingSteps = Int(self.scrollAccumulator / threshold)
+                        self.scrollAccumulator -= CGFloat(pendingSteps) * threshold
+                    }
+                } else {
+                    pendingSteps = dy > 0 ? -1 : (dy < 0 ? 1 : 0)
+                }
+                if pendingSteps != 0 {
+                    if onFavSide {
+                        self.applyFavScrollSteps(pendingSteps)
+                    } else {
+                        self.applyScrollSteps(pendingSteps)
+                    }
+                }
+                return nil
+            }
+
             if event.type == .mouseMoved {
+                self.cursorMoved = true
                 let loc = event.locationInWindow
                 var hitIndex: Int? = nil
                 var hitFavIndex: Int? = nil
@@ -588,7 +630,8 @@ final class SpokeOverlay {
                         let dy = loc.y - zone.dotCenter.y
                         let hitDot = sqrt(dx * dx + dy * dy) <= zone.dotRadius
                         let hitPill = zone.pillRect.contains(loc)
-                        if (hitDot || hitPill) && zone.index < self.currentFavorites.count {
+                        let favOffset = self.mouseTracker?.favScrollOffset ?? 0
+                        if (hitDot || hitPill) && favOffset + zone.index < self.currentFavorites.count {
                             self.selectFavWithFlash(zone.index, plainText: shift)
                             return nil
                         }
@@ -632,7 +675,7 @@ final class SpokeOverlay {
                     let lower = shortcutChars
                     if lower.count == 1, lower >= "a", lower <= "z" {
                         if let favIndex = self.currentFavorites.firstIndex(where: { $0.letter == lower }) {
-                            self.selectFavWithFlash(favIndex, plainText: plainTextShortcut)
+                            self.selectFavByFullIndex(favIndex, plainText: plainTextShortcut)
                             return nil
                         }
                     }
@@ -710,18 +753,59 @@ final class SpokeOverlay {
     /// Flash the selected item, then paste after a brief delay
     private func selectWithFlash(_ index: Int, plainText: Bool = false) {
         mouseTracker?.selectedIndex = index
+        let offset = mouseTracker?.scrollOffset ?? 0
+        let actualIndex = offset + index
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, index < self.currentItems.count else { return }
-            self.performSelectAndPaste(self.currentItems[index], plainText: plainText)
+            guard let self, actualIndex < self.allItems.count else { return }
+            self.performSelectAndPaste(self.allItems[actualIndex], plainText: plainText)
         }
     }
 
-    /// Flash a favorite, then paste after a brief delay
-    private func selectFavWithFlash(_ index: Int, plainText: Bool = false) {
-        mouseTracker?.selectedFavIndex = index
+    private func applyScrollSteps(_ steps: Int) {
+        guard let tracker = mouseTracker, steps != 0 else { return }
+        let windowSize = currentItems.count
+        let maxOffset = max(0, allItems.count - windowSize)
+        tracker.scrollOffset = max(0, min(maxOffset, tracker.scrollOffset + steps))
+        // Clear the highlight while scrolling; it feels wrong for a stationary
+        // cursor to keep highlighting whatever item scrolls under it. The next
+        // mouseMoved recomputes the hover from the cursor's actual position.
+        tracker.hoveredIndex = nil
+        tracker.selectedIndex = nil
+        scrollAccumulator = 0
+    }
+
+    private func applyFavScrollSteps(_ steps: Int) {
+        guard let tracker = mouseTracker, steps != 0 else { return }
+        let maxOffset = max(0, currentFavorites.count - layoutFavCount)
+        tracker.favScrollOffset = max(0, min(maxOffset, tracker.favScrollOffset + steps))
+        tracker.hoveredFavIndex = nil
+        tracker.selectedFavIndex = nil
+        scrollAccumulator = 0
+    }
+
+    /// Flash a favorite (by on-screen display index), then paste after a brief delay
+    private func selectFavWithFlash(_ displayIndex: Int, plainText: Bool = false) {
+        mouseTracker?.selectedFavIndex = displayIndex
+        let offset = mouseTracker?.favScrollOffset ?? 0
+        let actualIndex = offset + displayIndex
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, index < self.currentFavorites.count else { return }
-            self.performFavSelectAndPaste(self.currentFavorites[index], plainText: plainText)
+            guard let self, actualIndex < self.currentFavorites.count else { return }
+            self.performFavSelectAndPaste(self.currentFavorites[actualIndex], plainText: plainText)
+        }
+    }
+
+    /// Select a favorite by its full-list index (⌘+letter shortcut). Flashes the
+    /// on-screen dot only if that favorite is within the visible scroll window.
+    private func selectFavByFullIndex(_ fullIndex: Int, plainText: Bool = false) {
+        guard fullIndex < currentFavorites.count else { return }
+        let offset = mouseTracker?.favScrollOffset ?? 0
+        let displayIndex = fullIndex - offset
+        if displayIndex >= 0 && displayIndex < layoutFavCount {
+            mouseTracker?.selectedFavIndex = displayIndex
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, fullIndex < self.currentFavorites.count else { return }
+            self.performFavSelectAndPaste(self.currentFavorites[fullIndex], plainText: plainText)
         }
     }
 
@@ -905,6 +989,8 @@ final class MouseTracker {
     var shiftHeld: Bool = false
     var isSearching: Bool = false
     var searchText: String = ""
+    var scrollOffset: Int = 0
+    var favScrollOffset: Int = 0
 }
 
 // MARK: - SwiftUI spoke view
@@ -1135,7 +1221,8 @@ private final class OverlayBackdropController {
 private struct SpokeView: View {
     let items: [ClipboardItem]         // initial display items (overlayItemCount)
     let allItems: [ClipboardItem]      // all history items for search
-    let favorites: [FavoriteItem]
+    let favorites: [FavoriteItem]      // window used for layout (favWindowCount)
+    let allFavorites: [FavoriteItem]   // full favorites list for scroll windowing
     let previewLength: Int
     let backdropSpread: CGFloat
     let backdropIntensity: CGFloat
@@ -1166,11 +1253,26 @@ private struct SpokeView: View {
         CGPoint(x: centerX, y: centerY)
     }
 
-    /// Items currently displayed on the right side (filtered when searching)
+    /// Items currently displayed on the right side (scroll window or search filter)
     private var activeItems: [ClipboardItem] {
         let query = tracker.searchText
-        if query.isEmpty { return items }
-        return Array(allItems.lazy.filter { overlaySearchMatches($0.text, query: query) }.prefix(9))
+        if !query.isEmpty {
+            return Array(allItems.lazy.filter { overlaySearchMatches($0.text, query: query) }.prefix(9))
+        }
+        let offset = tracker.scrollOffset
+        let count  = items.count
+        let start  = min(offset, allItems.count)
+        let end    = min(start + count, allItems.count)
+        return Array(allItems[start..<end])
+    }
+
+    /// Favorites currently displayed on the left side (scroll window)
+    private var activeFavorites: [FavoriteItem] {
+        let offset = tracker.favScrollOffset
+        let count  = favorites.count
+        let start  = min(offset, allFavorites.count)
+        let end    = min(start + count, allFavorites.count)
+        return Array(allFavorites[start..<end])
     }
 
     /// Compute de-overlapped pill Y positions for a given set of items
@@ -1244,7 +1346,7 @@ private struct SpokeView: View {
                     )
 
                     // Numbered dot
-                    GlassDot(accent: .blue, isHighlighted: isHighlighted, label: "\(index + 1)")
+                    GlassDot(accent: .blue, isHighlighted: isHighlighted, label: "\(tracker.scrollOffset + index + 1)")
                         .frame(width: dotSize, height: dotSize)
                         .scaleEffect(isFlashed ? 1.3 : (isHighlighted ? 1.1 : 1.0))
                         .animation(.easeOut(duration: 0.12), value: isHighlighted)
@@ -1340,6 +1442,12 @@ private struct SpokeView: View {
             backdropController.clear()
         }
         .onChange(of: tracker.searchText) { _, _ in
+            scheduleBackdropSync()
+        }
+        .onChange(of: tracker.scrollOffset) { _, _ in
+            scheduleBackdropSync()
+        }
+        .onChange(of: tracker.favScrollOffset) { _, _ in
             scheduleBackdropSync()
         }
         .onChange(of: revealedCount) { _, _ in
@@ -1472,6 +1580,7 @@ private struct SpokeView: View {
         }
 
         if !hasSearchText {
+            let favWindow = activeFavorites
             for index in 0..<favorites.count where revealedFavIndices.contains(index) {
                 let angle = SpokeOverlay.favAngleForIndex(index, count: favorites.count, spokeRadius: spokeRadius, dotSize: dotSize)
                 let dotX = center.x + spokeRadius * cos(angle)
@@ -1480,7 +1589,7 @@ private struct SpokeView: View {
                 let pillX = favPillXPositions[index]
                 let pillHeight: CGFloat = 26
                 let visiblePillWidth = overlayFavoritePillWidth(
-                    for: favorites[index],
+                    for: index < favWindow.count ? favWindow[index] : favorites[index],
                     previewLength: previewLength,
                     maxWidth: previewWidth
                 )
@@ -1514,7 +1623,8 @@ private struct SpokeView: View {
 
     @ViewBuilder
     private func favItemView(index: Int) -> some View {
-        let fav = favorites[index]
+        let favWindow = activeFavorites
+        let fav = index < favWindow.count ? favWindow[index] : favorites[index]
         let angle = SpokeOverlay.favAngleForIndex(index, count: favorites.count, spokeRadius: spokeRadius, dotSize: dotSize)
         let dotX = center.x + spokeRadius * cos(angle)
         let dotY = center.y - spokeRadius * sin(angle)
