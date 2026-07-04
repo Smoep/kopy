@@ -26,6 +26,19 @@ Unzip and drag **Kopy.app** to your Applications folder.
 - Image clipboard support
 - Configurable global shortcut and UI tuning
 
+## Build & install
+
+Requires macOS 26 and Xcode 26+.
+
+```bash
+git clone https://github.com/Smoep/kopy.git
+cd kopy
+xcodebuild -project kopy.xcodeproj -scheme kopy -configuration Release \
+  -derivedDataPath build-release build
+cp -R build-release/Build/Products/Release/Kopy.app /Applications/Kopy.app
+open /Applications/Kopy.app
+```
+
 ## Built With
 - Swift
 - SwiftUI
