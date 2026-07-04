@@ -2,6 +2,15 @@
 
 Kopy is a macOS menu bar clipboard manager built for fast paste-by-number workflows.
 
+## Download
+
+[**→ Download Kopy.zip from the latest release**](https://github.com/Smoep/kopy/releases/latest)
+
+Unzip and drag **Kopy.app** to your Applications folder.
+
+> **First launch:** macOS will show a security warning because the app is not signed with an Apple Developer certificate.
+> Right-click (or Control-click) the app → **Open** → **Open**. You only need to do this once.
+
 ## Why Kopy
 - Keep a searchable clipboard history for text and images
 - Paste quickly from anywhere with a global keyboard shortcut
